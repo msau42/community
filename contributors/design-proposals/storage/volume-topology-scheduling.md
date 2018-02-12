@@ -1,6 +1,6 @@
 # Volume Topology-aware Scheduling
 
-Authors: @msau42
+Authors: @msau42, @lichuqiang
 
 This document presents a detailed design for making the default Kubernetes
 scheduler aware of volume topology constraints, and making the
@@ -102,7 +102,7 @@ type VolumeNodeAffinity struct {
 The `Required` field is a hard constraint and indicates that the PersistentVolume
 can only be accessed from Nodes that satisfy the NodeSelector.
 
-In the future, a `Preferred` field can be added to handle soft node contraints with
+In the future, a `Preferred` field can be added to handle soft node constraints with
 weights, but will not be included in the initial implementation.
 
 The advantages of this NodeAffinity field vs the existing method of using zone labels
@@ -245,7 +245,9 @@ phases.
 In alpha, this feature is controlled by a feature gate, VolumeScheduling, and
 must be configured in the kube-scheduler and kube-controller-manager.
 
-A new StorageClass field will be added to control the volume binding behavior.
+#### New field to control the volume binding behavior
+A new StorageClass field `VolumeBindingMode` will be added to control the volume
+binding behavior.
 
 ```
 type StorageClass struct {
@@ -275,6 +277,109 @@ StorageClasses for the volume types that need the new binding behavior.
 * User experience can be confusing because PVCs could have different binding
 behavior depending on the StorageClass configuration.  We will mitigate this by
 adding a new PVC event to indicate if binding will follow the new behavior.
+
+#### Add a way to override topology in StorageClass
+Provisioning related topology information is currently specified as elements
+of parameters in StorageClass, which is obscure to users. Here we extend
+StorageClass with a new NodeAffinity field that specifies
+the topology constraints, like we does for PersistentVolume:
+
+```
+type StorageClass struct {
+    ...
+    NodeAffinity *VolumeNodeAffinity
+}
+```
+
+Thus, in predicates, the scheduler would check with the topology affinity
+information along with existing NodeAffinity information from the pod when making scheduling decision.
+
+_TBD: the common NodeSelector could hardly cover use case of `replica-zones` and `replica-zones:auto`,
+which are largely storage-specific. To support the cases, we may need to have a
+modification on the field, or even create a whole new struct for this.
+I've not think it clearly, @msau42 would like to hear your opinion if you already have a mature idea.
+Besides, currently I seprerate the capacity topologyKey from the
+NodeAffinity field, for I think the scope of the two could vary. Anyway,
+If we decide to manage them in a single field, again we need to have a modification
+on the field, because currently a selector may contain a list of selectorTerms,
+it’s hard to get a single key from it._
+
+
+#### Store topology-key related capacity in StorageClass
+For local storage and other potential volume types whose capacity is divided
+according to certain dimension (e.g. local storage per node, zonal volume per zone),
+new StorageClass fields will be added to store topology-key related capacities,
+which would later be used by scheduler to do topology-aware provisioning:
+
+```
+type StorageClass struct {
+    ...
+    CapacityTopologyKey string
+    Status StorageClassStatus
+}
+
+type StorageClassStatus struct {
+    Capacity map[string]resource.Quantity
+}
+```
+`CapacityTopologyKey` represents the dimension that nodes and storage are divided.
+It matches the key of nodes's label, it could be node name, zone name or anything else
+ according to volume type.
+
+The field would be a basis of judgement on volume capacity, that is,
+if topologyKey is specified, we consider the volume capacity-aware, thus,
+a node without the label of topologyKey, or corresponding capacity of the dimension
+could not satisfy a PVC's requirement is thought to be unqualified.
+Otherwise, if topologyKey not specified, we assume the storage is of "infinite" capacity,
+and the capacity check would be skipped.
+
+Related validation should be added to ensure field CapacityTopologyKey immutable
+after creation.
+
+##### Example VolumeCapacity
+
+```
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: standard
+...
+capacityTopologyKey: kubernetes.io/hostname
+status:
+  capacity:
+    node1: 100Gi
+    node2: 200Gi
+```
+The new field provides a place for local storage and other potential storage
+that have zonal quotas to record topology-key related capacities.
+However, it has a few downsides:
+1. One concern may be object size. For example, if we have thousands of nodes
+   for local storage, the records in capacity would be horrible. Besides,
+   as the number of nodes grows, the chances of accessing conflicts to StorageClass
+   will also increase.
+2. We may experience a security issue, for example, for local storage,
+   provision plugin on a node may distort information of other nodes.
+3. Multi topology keys of capacity is not supported for one StorageClass,
+   as we have not seen such use case so far.
+4. No common mechanism to generate capacity records, each provisioner would have to
+   update their own fields in StorageClass if necessary.
+
+##### Relationship between The New Capacity Field and Existing StorageClassQuota
+Although both the new capacity field and existing StorageClassQuota work on the management
+of storage consumption, they take effect from different aspects.
+
+The capacity field is actual available capacity reported by the storage system,
+while the quota is set by cluster admin on Kubernetes side.
+So the former represents the topology related ability the system could indeed provide,
+and the later is an extra overall restriction on the system.
+
+A use case may look like this: A storage has a capacity of 200Gi in total,
+and it's related to two StorageClasses (for multi-tenancy or other issues),
+so the admin would not expect to see the storage exhausted by one of the StorageClasses,
+so he/she may give them each a quota of 100Gi. However, there is still a chance
+capacity of certain topology dimension get exhausted by one StorageClass,
+for existing StorageClassQuota is not topology related.
+
 
 ### Integrating binding with scheduling
 For the alpha phase, the focus is on static provisioning of PVs to support
@@ -492,7 +597,7 @@ if the API update fails, the cached updates need to be reverted and restored
 with the actual API object.  The cache will return either the cached-only
 object, or the informer object, whichever one is latest.  Informer updates
 will always override the cached-only object.  The new predicate and priority
-functions must get the objects from this cache intead of from the informer cache.
+functions must get the objects from this cache instead of from the informer cache.
 This cache only stores pointers to objects and most of the time will only
 point to the informer object, so the memory footprint per object is small.
 
@@ -727,18 +832,131 @@ cannot find a node for the pod, then it will encounter scheduling failure and
 initiate the rollback.
 
 ### Making dynamic provisioning topology aware
-TODO (beta): Design details
+For the new volume provisioning mode, the proposed new workflow is:
+1. User creates unbound PVC and there are no PVs matching it.
+2. User creates a pod that uses the PVC.
+3. Pod starts to get processed by the scheduler.
+4. In predicate function of VolumeBindingChecker,
+   scheduler fail to find matching PVs
+5. **NEW:** still in the function, it checks if dynamic provisioning
+   is possible for that node.
+6. The scheduler continues to evaluate priorities. priority function
+   PrioritizeUnboundPVCs will get the PV matches per PVC per node,
+   along with provisioned PVCs per node, and compute a priority score
+   based on various factors.
+7. After picking a node, the scheduler calls assume function `AssumePodVolumes`,
+   to check if any binding operations need to be done. If so, it will update
+   the PV cache to mark the PVs with the chosen PVCs.
+8. **NEW:** Still in the assume func, it also check if any provisioning operations
+   is needed. If so, it will update the PVC cache (store provisioned PVCs
+   per StorageClass), to mark the capacity occupied.
+9. If PVC binding or provisioning is required, we do NOT AssumePod. Instead,
+   a new bind function, BindPVCs, will be called asynchronously,
+   passing in the selected node. The bind function will prebind the PV to the PVC,
+   or trigger dynamic provisioning (NEW). Then, it always sends the Pod through the
+   scheduler again.
+10. When a Pod makes a successful scheduler pass once all PVCs are bound/provisioned,
+   the scheduler assumes and binds the Pod to a Node.
+11. Kubelet starts the Pod.
 
-For alpha, we are not focusing on this use case.  But it should be able to
-follow the new workflow closely with some modifications.
-* The FindUnboundPVCs predicate function needs to get provisionable capacity per
-topology dimension from the provisioner somehow.
-* The PrioritizeUnboundPVCs priority function can add a new priority score factor
-based on available capacity per node.
-* The BindUnboundPVCs bind function needs to pass in the node to the provisioner.
-The internal and external provisioning APIs need to be updated to take in a node
-parameter.
+#### Scheduler Changes
 
+##### Predicate
+
+In the predicate function of VolumeBindingChecker, if the scheduler fail
+to find matching volumes for an unbound claim, instead of return false as it does now,
+the scheduler tries to trigger provisioning:
+1. If the PVC has an anotation of `annStorageProvisioner`, it means provisioning
+   has already been triggered on the PVC, skip following steps for the PVC,
+   to wait for the provisioning to finish
+2. Fetch the StorageClass according to the PVC.
+3. Check if provisioner is specified in StorageClass, if not, return false directly
+4. Check if the node could satisfy the topology requirement in StorageClass, if not,
+   return false directly
+5. Check if `CapacityTopologyKey` is specified in the StorageClass, if not,
+   we assume the storage is of infinite capacity, and skip the check on capacity
+6. If specified, go through the labels on the node, to see if any label key could
+   match the CapacityTopologyKey, if not, we assume the node not match the capacity
+   requirement.
+7. If match, try to find capacity value with node label value as the capacity
+   record key (e.g. node1 has label "kubernetes.io/hostname=node1", storageclass S1
+   has CapacityTopologyKey "capacityTopologyKey=kubernetes.io/hostname", then the
+   scheduler tries to find capacity information with "node1" as key of capacity map
+   in StorageClass, S1.status.capacity["node1"]). If capacity not found, or the
+   allocatable storage (recorded capacity reduces that already used) is smaller than
+   that required in PVC, we assume the node not match the capacity requirement.
+8. If capacity requirement satisfied, Temporarily cache provisioned PVCs per Node,
+   for fast processing later in the priority and bind function
+9. Continue to process next claim of the pod
+
+##### Assume
+
+For better scheduler performance, we'll assume that the provisioning
+will likely succeed, and update the cache with the PVC provisioned,
+assuming the part of the capacity occupied, so that scheduler could
+continue processing privsioning before actual API update on PVC
+(update in VolumeName field that indicates provisioning finished).
+
+In addition to `bindingRequired` that function `AssumePodVolumes`currently
+returns, one more result named "provisioningRequired" would be returned too,
+for triggering provisioning in later bind function
+
+##### Bind
+
+If `AssumePodVolumes` returns `provisioningRequired`, in the bind function,
+we try to set three annotations on related PVCs:
+* `annStorageProvisioner` to trigger dynamic provisioning in PV controller
+* `annSelectedNode` to inform the provisioners of chosen node when provisioning
+* `annCapacityTopology` in format of "key=value", for better support on storage
+consumption management.
+
+If fail to set the annotations, revert the cache updates.
+
+##### Cache
+
+Similar to the caches introduced for binding, there are two new caches
+needed for provisioning.
+
+The first cache is for handling PVC updates occurring asynchronously with
+the main scheduler loop. function AssumePodVolumes needs to store the
+assumed PVC objects as provisioned, so that future provisioning decisions
+will not miscalculate allocatable capacity.
+
+The relationship between PVCs and StorageClasses in the cache is exactly like
+that of pods and nodes in schedulerCache: PVCs are stored per StorageClass;
+there should also be status fields of `pvcState` and `assumedPvc` to manage
+assumed PVCs:
+remove PVCs out of cache if provisioning not succeed after a specific time (timeout),
+and remove state field `assumedPvc` from the PVC when its provisioning finished.
+
+Thus, with `annCapacityTopology` marked in PVCs, scheduler could easily
+figure out storage consumption per topology per StorageClass during predicates.
+
+**Note:** we only cache provisioned PVCs, PVCs bound with static PVs are
+out of consideration. This could be identified via certain annotations in PVCs.
+
+The second cache is for storing temporary state as the Pod goes
+from predicates to priorities and then assume. This cache is used for:
+
+* Indicating if the PVCs are already provisioned at the beginning of
+  the pod scheduling loop. This is to handle situations where volumes
+  may have become provisioned in the middle of processing the predicates.
+
+* Caching provisioning needed PVCs per node decisions that
+  the predicate had made. This is an optimization to avoid
+  walking through all the PVCs again in priority and assume functions.
+  (_TBD: a new cache or extend the current podBindingCache_)
+
+#### PV Controller Changes
+
+When the VolumeScheduling feature is enabled, dynamic provisioning will be
+skipped by the controller if VolumBindingWaitForFirstConsumer is set.
+The scheduler will signal to the PV controller to start dynamic provisioning
+by setting the annStorageProvisioner annotation in the PVC.
+
+If the controller find an annotation of `annSelectedNode` in the claim,
+it will pass the node name into provision call, to make the provisioner
+topology-aware.
 
 ## Testing
 
